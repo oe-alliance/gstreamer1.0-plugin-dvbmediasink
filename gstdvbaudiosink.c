@@ -1715,7 +1715,7 @@ static gboolean gst_dvbaudiosink_start(GstBaseSink * basesink)
 	self->pesheader_buffer = gst_buffer_new_and_alloc(256);
 
 	GST_OBJECT_LOCK(self);
-	self->fd = open("/dev/dvb/adapter0/audio0", O_RDWR | O_NONBLOCK);
+	self->fd = open(AUDIO_DEVICE, O_RDWR | O_NONBLOCK);
 	GST_OBJECT_UNLOCK(self);
 
 	self->pts_written = FALSE;

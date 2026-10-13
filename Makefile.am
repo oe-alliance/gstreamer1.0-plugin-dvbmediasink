@@ -12,7 +12,11 @@ CLEANFILES = $(BUILT_SOURCES)
 
 EXTRA_DIST = gstdvbsink-marshal.list
 
-plugin_LTLIBRARIES = libgstdvbvideosink.la libgstdvbaudiosink.la
+plugin_LTLIBRARIES = libgstdvbaudiosink.la
+if HAVE_VIDEOSINK
+# the unpacker feeds the video sink
+plugin_LTLIBRARIES += libgstdvbvideosink.la libgstmpeg4p2unpack.la
+endif
 
 # for the next set of variables, rename the prefix if you renamed the .la
 
@@ -32,8 +36,6 @@ libgstdvbaudiosink_la_LDFLAGS = $(GST_PLUGIN_LDFLAGS)
 
 # headers we need but don't want installed
 noinst_HEADERS = gstdvbvideosink.h gstdvbaudiosink.h gstdtsdownmix.h gstmpeg4p2unpack.h dtsframe.h
-
-plugin_LTLIBRARIES += libgstmpeg4p2unpack.la
 
 libgstmpeg4p2unpack_la_SOURCES = gstmpeg4p2unpack.c
 

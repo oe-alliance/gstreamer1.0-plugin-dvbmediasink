@@ -303,6 +303,9 @@ AC_DEFINE_UNQUOTED(machine,"$machine",[machine])
 if test `echo "$machine" | cut -b 1-2` == "dm" -o `echo "$machine" | cut -b 1-5` == "dream"; then
 	AC_DEFINE([DREAMBOX],[1],[build for DREAMBOX ])
 fi
+if test "$machine" == "dreamone" -o "$machine" == "dreamtwo"; then
+	AC_DEFINE([DREAMNEXTGEN],[1],[build for the Dream decoder interface of dreamone and dreamtwo])
+fi
 if test `echo "$machine" | cut -b 1-2` == "vu"; then
 	AC_DEFINE([VUPLUS],[1],[build for VUPLUS ])
 fi

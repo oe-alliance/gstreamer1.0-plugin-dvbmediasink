@@ -81,7 +81,10 @@ typedef enum {
 	CT_SPARK = 9,
 	CT_VP6 = 10,
 	CT_VP8 = 11,
-	CT_VP9 = 12
+	CT_VP9 = 12,
+	CT_MJPEG = 13,
+	CT_REAL = 14,
+	CT_AVS = 15
 } t_codec_type;
 #if defined(DREAMBOX)
 typedef enum {
@@ -101,7 +104,12 @@ typedef enum {
 	STREAMTYPE_VB6 = 18,
 	STREAMTYPE_VB8 = 20,
 	STREAMTYPE_VB9 = 23,
-	STREAMTYPE_SPARK = 21
+	STREAMTYPE_SPARK = 21,
+#ifdef DREAMNEXTGEN
+	STREAMTYPE_MJPEG = 5,
+	STREAMTYPE_AVS = 7,
+	STREAMTYPE_REAL = 31,
+#endif
 } t_stream_type;
 #endif
 #if defined(TYPE2) && !defined(DREAMBOX)
@@ -177,6 +185,24 @@ struct _GstDVBVideoSink
 	gboolean use_set_encoding;
 
 	queue_entry_t *queue;
+#ifdef DREAMNEXTGEN
+	/* the Dream decoder takes whole access units, the PES writes collect one */
+	int poll_fd;
+	GByteArray *frame;
+	guint64 frame_pts;
+	GQueue frames;
+	guint64 flush_vpts;
+	/* after a stall: drop the frames up to the next keyframe */
+	gboolean wait_keyframe;
+	/* first PTS written since the flush */
+	guint64 start_pts;
+	guint frames_written;
+	guint frames_refused;
+	/* codec_data and size for the codecs in their own framing */
+	GstBuffer *headers;
+	gint width, height;
+	gint info_width, info_height, info_aspect, info_framerate, info_progressive;
+#endif
 };
 
 struct _GstDVBVideoSinkClass 

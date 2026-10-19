@@ -194,6 +194,8 @@ struct _GstDVBVideoSink
 	guint64 flush_vpts;
 	/* after a stall: drop the frames up to the next keyframe */
 	gboolean wait_keyframe;
+	/* first PTS of a trick mode, the others are scaled from it */
+	guint64 trick_base;
 	/* first PTS written since the flush */
 	guint64 start_pts;
 	guint frames_written;

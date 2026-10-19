@@ -350,7 +350,9 @@ static void dream_post_info(GstDVBVideoSink *self)
 			"width", G_TYPE_INT, width,
 			"height", G_TYPE_INT, height, NULL));
 	}
-	if (framerate > 0 && framerate != self->info_framerate)
+	/* the scaled PTS of a trick mode give a frame rate of their own, it
+	 * would switch the video mode */
+	if (framerate > 0 && framerate != self->info_framerate && self->rate == 1.0)
 	{
 		self->info_framerate = framerate;
 		dream_post(self, gst_structure_new("eventFrameRateChanged",
@@ -392,6 +394,24 @@ static void dream_frame_free(gpointer data)
 	g_free(entry);
 }
 
+/* the 33 bit distance from base to pts */
+static gint64 dream_pts_diff(guint64 pts, guint64 base)
+{
+	gint64 diff = (gint64)((pts - base) & DREAM_PTS_MASK);
+	return diff >= (1LL << 32) ? diff - (1LL << 33) : diff;
+}
+
+/* A trick mode plays at the decoder's normal pace, the PTS are scaled by the
+ * rate from the first one; backwards they are mirrored and keep rising. */
+static guint64 dream_trick_pts(GstDVBVideoSink *self, guint64 pts)
+{
+	if (self->rate == 1.0 || pts == DREAM_PTS_NONE)
+		return pts;
+	if (self->trick_base == DREAM_PTS_NONE)
+		self->trick_base = pts;
+	return (self->trick_base + (gint64)(dream_pts_diff(pts, self->trick_base) / self->rate)) & DREAM_PTS_MASK;
+}
+
 static void dream_flush(GstDVBVideoSink *self)
 {
 	g_queue_clear_full(&self->frames, dream_frame_free);
@@ -402,7 +422,9 @@ static void dream_flush(GstDVBVideoSink *self)
 	}
 	self->flush_vpts = dream_tsync("pts_video");
 	self->start_pts = DREAM_PTS_NONE;
-	self->wait_keyframe = FALSE;
+	/* after a seek the decoder starts at a keyframe */
+	self->wait_keyframe = TRUE;
+	self->trick_base = DREAM_PTS_NONE;
 }
 
 /* collect the PES writes of one access unit, drop the PES header itself */
@@ -560,7 +582,7 @@ static int dream_write_frame(GstDVBVideoSink *self)
 		{
 			dream_frame_t *entry = g_new0(dream_frame_t, 1);
 			entry->data = self->frame;
-			entry->pts = self->frame_pts;
+			entry->pts = dream_trick_pts(self, self->frame_pts);
 			g_queue_push_tail(&self->frames, entry);
 		}
 		else
@@ -1194,6 +1216,12 @@ static gint64 gst_dvbvideosink_get_decoder_time(GstDVBVideoSink *self)
 		cur = self->lastpts;
 	}
 #ifdef DREAMNEXTGEN
+	/* the position in the stream, not the scaled PTS of a trick mode; the
+	 * picture of before the seek has none in it */
+	if (self->rate != 1.0 && (self->trick_base == DREAM_PTS_NONE || dream_tsync("pts_video") == self->flush_vpts))
+		return GST_CLOCK_TIME_NONE;
+	if (self->rate != 1.0)
+		cur = (gint64)((self->trick_base + (gint64)(dream_pts_diff(cur, self->trick_base) * self->rate)) & DREAM_PTS_MASK);
 	cur = gst_util_uint64_scale(cur & DREAM_PTS_MASK, 100000, 9);
 #else
 	cur *= 11111;
@@ -1398,6 +1426,18 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 		if (format == GST_FORMAT_TIME)
 		{
 			self->timestamp_offset = start - pos;
+#ifdef DREAMNEXTGEN
+			/* a backwards segment starts at its stop, the PTS need no offset */
+			if (rate < 0.0)
+				self->timestamp_offset = 0;
+			/* the decoder's own trick mode starts only for some streams,
+			 * dream_trick_pts scales the PTS instead */
+			if (rate != self->rate)
+			{
+				self->trick_base = DREAM_PTS_NONE;
+				self->rate = rate;
+			}
+#else
 			if (rate != self->rate)
 			{
 				int skip = 0, repeat = 0;
@@ -1414,6 +1454,7 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 				ioctl(self->fd, VIDEO_CONTINUE);
 				self->rate = rate;
 			}
+#endif
 		}
 		break;
 	}
@@ -2733,6 +2774,7 @@ static gboolean gst_dvbvideosink_start(GstBaseSink *basesink)
 	self->flush_vpts = dream_tsync("pts_video");
 	self->start_pts = DREAM_PTS_NONE;
 	self->wait_keyframe = FALSE;
+	self->trick_base = DREAM_PTS_NONE;
 	self->frames_written = self->frames_refused = 0;
 	self->info_width = self->info_height = self->info_aspect = self->info_framerate = self->info_progressive = -1;
 #endif

@@ -84,7 +84,8 @@ typedef enum {
 	CT_VP9 = 12,
 	CT_MJPEG = 13,
 	CT_REAL = 14,
-	CT_AVS = 15
+	CT_AVS = 15,
+	CT_AVS2 = 16
 } t_codec_type;
 #if defined(DREAMBOX)
 typedef enum {
@@ -108,6 +109,7 @@ typedef enum {
 #ifdef DREAMNEXTGEN
 	STREAMTYPE_MJPEG = 5,
 	STREAMTYPE_AVS = 7,
+	STREAMTYPE_AVS2 = 15,
 	STREAMTYPE_REAL = 31,
 #endif
 } t_stream_type;

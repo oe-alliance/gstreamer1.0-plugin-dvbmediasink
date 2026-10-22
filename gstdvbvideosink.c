@@ -258,6 +258,10 @@ static gboolean dream_codec(GstDVBVideoSink *self, int *streamtype, uint32_t *fo
 		*streamtype = 7;
 		*format = 13;
 		return TRUE;
+	case CT_AVS2:
+		*streamtype = 15;
+		*format = 0;
+		return TRUE;
 	default:
 		/* set_caps leaves the codec type of DivX 5/6 alone */
 		if (self->stream_type != STREAMTYPE_DIVX5)
@@ -936,6 +940,7 @@ GST_STATIC_PAD_TEMPLATE (
 	"video/x-pn-realvideo, "
 		VIDEO_CAPS ", rmversion = (int) { 3, 4 }; "
 	"video/x-cavs; "
+	"video/x-avs2; "
 #endif
 	)
 );
@@ -2545,6 +2550,12 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 		self->stream_type = STREAMTYPE_AVS;
 		self->codec_type = CT_AVS;
 		GST_INFO_OBJECT (self, "MIMETYPE video/x-cavs -> STREAMTYPE_AVS");
+	}
+	else if (!strcmp (mimetype, "video/x-avs2"))
+	{
+		self->stream_type = STREAMTYPE_AVS2;
+		self->codec_type = CT_AVS2;
+		GST_INFO_OBJECT (self, "MIMETYPE video/x-avs2 -> STREAMTYPE_AVS2");
 	}
 #endif
 

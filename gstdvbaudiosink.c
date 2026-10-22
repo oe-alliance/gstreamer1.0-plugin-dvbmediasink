@@ -1084,6 +1084,9 @@ static gboolean gst_dvbaudiosink_event(GstBaseSink *sink, GstEvent *event)
 		gint64 previous_pts = 0;
 		gint64 current_pts = 0;
 		gboolean first_loop_done = FALSE;
+#ifdef DREAMNEXTGEN
+		int idle_loops = 0;
+#endif
 		GST_BASE_SINK_PREROLL_UNLOCK(sink);
 		while (1)
 		{
@@ -1121,6 +1124,15 @@ static gboolean gst_dvbaudiosink_event(GstBaseSink *sink, GstEvent *event)
 				 * We only will react on empty buffer event for streamed media which remains at zero
 				 * Like usual this is not the case for all live streamed media */
 				current_pts = gst_dvbaudiosink_get_decoder_time(self);
+#ifdef DREAMNEXTGEN
+				/* the Dream decoder gives no buffer empty event, an idle decoder reads 0;
+				 * with sync the EOS comes after the last buffer has played */
+				if (current_pts <= 0 && first_loop_done && ++idle_loops >= (gst_base_sink_get_sync(sink) ? 2 : 8))
+				{
+					GST_INFO_OBJECT(self, "decoder idle, push eos to basesink");
+					break;
+				}
+#endif
 
 				if(current_pts > 0 || x >= 1)
 				{

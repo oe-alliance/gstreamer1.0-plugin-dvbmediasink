@@ -554,6 +554,11 @@ static gint64 gst_dvbaudiosink_get_decoder_time(GstDVBAudioSink *self)
 	gint res = -1;
 	if (self->fd < 0 || !self->playing || !self->pts_written)
 		return GST_CLOCK_TIME_NONE;
+#ifdef DREAMNEXTGEN
+	/* a trick mode goes without sound, the video has the position */
+	if (self->rate != 1.0)
+		return GST_CLOCK_TIME_NONE;
+#endif
 
 	res = ioctl(self->fd, AUDIO_GET_PTS, &cur);
 	if (cur && res >= 0)
@@ -1079,6 +1084,9 @@ static gboolean gst_dvbaudiosink_event(GstBaseSink *sink, GstEvent *event)
 		gint64 previous_pts = 0;
 		gint64 current_pts = 0;
 		gboolean first_loop_done = FALSE;
+#ifdef DREAMNEXTGEN
+		int idle_loops = 0;
+#endif
 		GST_BASE_SINK_PREROLL_UNLOCK(sink);
 		while (1)
 		{
@@ -1116,6 +1124,15 @@ static gboolean gst_dvbaudiosink_event(GstBaseSink *sink, GstEvent *event)
 				 * We only will react on empty buffer event for streamed media which remains at zero
 				 * Like usual this is not the case for all live streamed media */
 				current_pts = gst_dvbaudiosink_get_decoder_time(self);
+#ifdef DREAMNEXTGEN
+				/* the Dream decoder gives no buffer empty event, an idle decoder reads 0;
+				 * with sync the EOS comes after the last buffer has played */
+				if (current_pts <= 0 && first_loop_done && ++idle_loops >= (gst_base_sink_get_sync(sink) ? 2 : 8))
+				{
+					GST_INFO_OBJECT(self, "decoder idle, push eos to basesink");
+					break;
+				}
+#endif
 
 				if(current_pts > 0 || x >= 1)
 				{
@@ -1171,6 +1188,17 @@ static gboolean gst_dvbaudiosink_event(GstBaseSink *sink, GstEvent *event)
  		if (format == GST_FORMAT_TIME)
 		{
 			self->timestamp_offset = start - pos;
+#ifdef DREAMNEXTGEN
+			/* the audio decoder plays in real time only, a trick mode goes
+			 * without sound and the video runs the clock */
+			if (self->fd >= 0 && (rate != 1.0) != (self->rate != 1.0))
+			{
+				if (rate != 1.0)
+					ioctl(self->fd, AUDIO_PAUSE);
+				else if (!self->paused)
+					ioctl(self->fd, AUDIO_CONTINUE);
+			}
+#endif
 			self->rate = rate;
 		}
 		break;
@@ -1575,6 +1603,10 @@ static GstFlowReturn gst_dvbaudiosink_render(GstBaseSink *sink, GstBuffer *buffe
 		gst_sleepms(1200);
 		GST_INFO_OBJECT(self,"RESUME PLAY AFTER FLUSH + 1,2 SECOND");
 	}
+#ifdef DREAMNEXTGEN
+	if (self->rate != 1.0)
+		return GST_FLOW_OK;
+#endif
 	if (self->bypass <= AUDIOTYPE_UNKNOWN)
 	{
 		GST_ELEMENT_ERROR(self, STREAM, FORMAT,(NULL), ("hardware decoder not setup (no caps in pipeline?)"));
@@ -1715,7 +1747,7 @@ static gboolean gst_dvbaudiosink_start(GstBaseSink * basesink)
 	self->pesheader_buffer = gst_buffer_new_and_alloc(256);
 
 	GST_OBJECT_LOCK(self);
-	self->fd = open("/dev/dvb/adapter0/audio0", O_RDWR | O_NONBLOCK);
+	self->fd = open(AUDIO_DEVICE, O_RDWR | O_NONBLOCK);
 	GST_OBJECT_UNLOCK(self);
 
 	self->pts_written = FALSE;
@@ -1875,7 +1907,11 @@ static GstStateChangeReturn gst_dvbaudiosink_change_state(GstElement *element, G
 			GST_INFO_OBJECT(self, "USING DTSDOWMIX DELAY START 1800 ms");
 		}
 #endif
+#ifdef DREAMNEXTGEN
+		if (self->fd >= 0 && self->rate == 1.0)
+#else
 		if (self->fd >= 0)
+#endif
 		{
 			ioctl(self->fd, AUDIO_CONTINUE);
 		}

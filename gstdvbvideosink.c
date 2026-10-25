@@ -127,6 +127,700 @@ static int readApiFrameRate(int fd, int *framerate)
 GST_DEBUG_CATEGORY_STATIC (dvbvideosink_debug);
 #define GST_CAT_DEFAULT dvbvideosink_debug
 
+#ifdef DREAMNEXTGEN
+/* The Dream decoder of dreamone/dreamtwo refuses PES writes. It takes the
+ * decoder setup by VIDEO_SET_DEC_SYSINFO and whole access units by
+ * VIDEO_SET_FRAME. */
+struct dream_dec_sysinfo
+{
+	uint32_t format;
+	uint32_t width;
+	uint32_t height;
+	uint32_t rate; /* frame duration in 96 kHz ticks */
+	uint32_t extra;
+	uint32_t status;
+	uint32_t ratio;
+	void *param;
+	uint64_t ratio64;
+};
+
+struct dream_video_frame
+{
+	uint64_t pts; /* 90 kHz */
+	ssize_t bytes[8];
+	const uint8_t *data[8];
+	int is_phys_addr[8];
+};
+
+G_STATIC_ASSERT(sizeof(struct dream_dec_sysinfo) == 48);
+G_STATIC_ASSERT(sizeof(struct dream_video_frame) == 168);
+
+#define DREAM_VIDEO_SET_FRAME _IOWR('o', 64, struct dream_video_frame)
+#define DREAM_VIDEO_SET_DEC_SYSINFO _IOWR('o', 65, struct dream_dec_sysinfo)
+#define DREAM_EVENT_PTS_VALID 0x20
+#define DREAM_PTS_MASK 0x1ffffffffULL
+#define DREAM_PTS_NONE G_MAXUINT64
+/* a write which waits long for room ends in a driver write timeout, after
+ * which the driver drops every frame until a flush: write at most this far
+ * ahead of the frame on screen */
+#define DREAM_LEAD (2 * 90000)
+#define DREAM_STALL_MS 1200
+
+typedef struct
+{
+	GByteArray *data;
+	guint64 pts;
+	guint offset;
+} dream_frame_t;
+
+static guint64 dream_tsync(const char *name)
+{
+	char path[64], buf[32];
+	guint64 value = 0;
+	snprintf(path, sizeof(path), "/sys/class/tsync/%s", name);
+	FILE *f = fopen(path, "r");
+	if (f)
+	{
+		if (fgets(buf, sizeof(buf), f))
+			value = g_ascii_strtoull(buf, NULL, 16);
+		fclose(f);
+	}
+	return value;
+}
+
+static int dream_read_int(const char *path)
+{
+	int value = -1;
+	FILE *f = fopen(path, "r");
+	if (f)
+	{
+		if (fscanf(f, "%d", &value) != 1)
+			value = -1;
+		fclose(f);
+	}
+	return value;
+}
+
+static gboolean dream_codec(GstDVBVideoSink *self, int *streamtype, uint32_t *format)
+{
+	switch (self->codec_type)
+	{
+	case CT_MPEG1:
+	case CT_MPEG2:
+		*streamtype = 0;
+		*format = 0;
+		return TRUE;
+	case CT_H264:
+		*streamtype = 1;
+		*format = 4;
+		return TRUE;
+	case CT_H265:
+		*streamtype = 22;
+		*format = 15;
+		return TRUE;
+	case CT_MPEG4_PART2:
+		/* H.263 comes as MPEG-4 from the flv2mpeg4 element */
+		if (self->stream_type == STREAMTYPE_H263)
+			return FALSE;
+		*streamtype = 4;
+		*format = 3;
+		return TRUE;
+	case CT_DIVX4:
+		*streamtype = 4;
+		*format = 2;
+		return TRUE;
+	case CT_DIVX311:
+		*streamtype = 4;
+		*format = 1;
+		return TRUE;
+	case CT_VP9:
+		*streamtype = 23;
+		*format = 16;
+		return TRUE;
+	case CT_VC1:
+		*streamtype = 3;
+		*format = 11;
+		return TRUE;
+	case CT_VC1_SM:
+		*streamtype = 3;
+		*format = 10;
+		return TRUE;
+	case CT_MJPEG:
+		*streamtype = 5;
+		*format = 5;
+		return TRUE;
+	case CT_REAL:
+		/* the format of RealVideo 3, dream_setup takes 9 for version 4 */
+		*streamtype = 31;
+		*format = 8;
+		return TRUE;
+	case CT_AVS:
+		*streamtype = 7;
+		*format = 13;
+		return TRUE;
+	case CT_AVS2:
+		*streamtype = 15;
+		*format = 0;
+		return TRUE;
+	default:
+		/* set_caps leaves the codec type of DivX 5/6 alone */
+		if (self->stream_type != STREAMTYPE_DIVX5)
+			return FALSE;
+		*streamtype = 4;
+		*format = 3;
+		return TRUE;
+	}
+}
+
+/* codecs whose access units the Dream decoder takes in its own framing */
+static gboolean dream_raw_codec(GstDVBVideoSink *self)
+{
+	return self->codec_type == CT_VP9 || self->codec_type == CT_DIVX311 || self->codec_type == CT_VC1 || self->codec_type == CT_VC1_SM ||
+		self->codec_type == CT_MJPEG || self->codec_type == CT_REAL;
+}
+
+static gboolean dream_setup(GstDVBVideoSink *self, GstStructure *structure)
+{
+	struct dream_dec_sysinfo sysinfo;
+	int streamtype, numerator, denominator, width = 0, height = 0;
+	uint32_t format;
+	const GValue *codec_data = gst_structure_get_value(structure, "codec_data");
+	const gchar *wmv = gst_structure_get_string(structure, "format");
+	if (self->fd < 0 || !dream_codec(self, &streamtype, &format))
+		return FALSE;
+	/* the decoder knows WMV9 and VC-1 advanced profile only */
+	if ((self->codec_type == CT_VC1 && g_strcmp0(wmv, "WVC1")) ||
+		(self->codec_type == CT_VC1_SM && g_strcmp0(wmv, "WMV3") && g_strcmp0(wmv, "WVC3")))
+		return FALSE;
+	gst_structure_get_int(structure, "width", &width);
+	gst_structure_get_int(structure, "height", &height);
+	if (self->headers)
+		gst_buffer_unref(self->headers);
+	self->headers = codec_data && GST_VALUE_HOLDS_BUFFER(codec_data) ? gst_buffer_ref(gst_value_get_buffer(codec_data)) : NULL;
+	self->width = width;
+	self->height = height;
+	if (self->codec_type == CT_VC1_SM && (!self->headers || gst_buffer_get_size(self->headers) < 4))
+		return FALSE;
+	if (self->codec_type == CT_DIVX311 && (width <= 0 || height <= 0 || width > 4095 || height > 4095))
+		return FALSE;
+	if (self->codec_type == CT_REAL)
+	{
+		int version = 0;
+		gst_structure_get_int(structure, "rmversion", &version);
+		if (version != 3 && version != 4)
+			return FALSE;
+		format = version == 3 ? 8 : 9;
+	}
+	memset(&sysinfo, 0, sizeof(sysinfo));
+	sysinfo.format = format;
+	sysinfo.width = width;
+	sysinfo.height = height;
+	if (gst_structure_get_fraction(structure, "framerate", &numerator, &denominator) && numerator > 0 && denominator > 0)
+		sysinfo.rate = gst_util_uint64_scale(96000, denominator, numerator);
+	else
+		sysinfo.rate = 3200;
+	/* param stays NULL, other values wedge the decoder */
+	if (ioctl(self->fd, DREAM_VIDEO_SET_DEC_SYSINFO, &sysinfo) < 0)
+	{
+		GST_ERROR_OBJECT(self, "VIDEO_SET_DEC_SYSINFO format %u failed: %s", format, g_strerror(errno));
+		return FALSE;
+	}
+	GST_INFO_OBJECT(self, "decoder format %u streamtype %d %ux%u rate %u", format, streamtype, sysinfo.width, sysinfo.height, sysinfo.rate);
+	return ioctl(self->fd, VIDEO_SET_STREAMTYPE, streamtype) >= 0;
+}
+
+static void dream_post(GstDVBVideoSink *self, GstStructure *s)
+{
+	gst_element_post_message(GST_ELEMENT(self), gst_message_new_element(GST_OBJECT(self), s));
+}
+
+/* the driver sends no size or frame rate events */
+static void dream_post_info(GstDVBVideoSink *self)
+{
+	int width = dream_read_int("/sys/class/video/frame_width");
+	int height = dream_read_int("/sys/class/video/frame_height");
+	int framerate = dream_read_int("/proc/stb/vmpeg/0/frame_rate");
+	int progressive = dream_read_int("/proc/stb/vmpeg/0/progressive");
+	int aspect = 2, w, h;
+	if (readApiSize(self->fd, &w, &h, &aspect) < 0)
+		aspect = 2;
+	if (width > 0 && height > 0 && (width != self->info_width || height != self->info_height || aspect != self->info_aspect))
+	{
+		self->info_width = width;
+		self->info_height = height;
+		self->info_aspect = aspect;
+		dream_post(self, gst_structure_new("eventSizeChanged",
+			"aspect_ratio", G_TYPE_INT, aspect,
+			"width", G_TYPE_INT, width,
+			"height", G_TYPE_INT, height, NULL));
+	}
+	/* the scaled PTS of a trick mode give a frame rate of their own, it
+	 * would switch the video mode */
+	if (framerate > 0 && framerate != self->info_framerate && self->rate == 1.0)
+	{
+		self->info_framerate = framerate;
+		dream_post(self, gst_structure_new("eventFrameRateChanged",
+			"frame_rate", G_TYPE_INT, framerate, NULL));
+	}
+	if ((progressive == 0 || progressive == 1) && progressive != self->info_progressive)
+	{
+		self->info_progressive = progressive;
+		dream_post(self, gst_structure_new("eventProgressiveChanged",
+			"progressive", G_TYPE_INT, progressive, NULL));
+	}
+}
+
+static void dream_read_events(GstDVBVideoSink *self)
+{
+	int i;
+	for (i = 0; i < 16; i++)
+	{
+		struct video_event evt;
+		/* an empty event queue answers with type 0, not with an error */
+		if (ioctl(self->fd, VIDEO_GET_EVENT, &evt) < 0 || !evt.type)
+			break;
+		if (evt.type == DREAM_EVENT_PTS_VALID)
+			dream_post_info(self);
+	}
+}
+
+static void dream_read_commands(GstDVBVideoSink *self)
+{
+	gchar command;
+	while (read(self->unlockfd[0], &command, 1) > 0)
+		;
+}
+
+static void dream_frame_free(gpointer data)
+{
+	dream_frame_t *entry = data;
+	g_byte_array_unref(entry->data);
+	g_free(entry);
+}
+
+/* the 33 bit distance from base to pts */
+static gint64 dream_pts_diff(guint64 pts, guint64 base)
+{
+	gint64 diff = (gint64)((pts - base) & DREAM_PTS_MASK);
+	return diff >= (1LL << 32) ? diff - (1LL << 33) : diff;
+}
+
+/* A trick mode plays at the decoder's normal pace, the PTS are scaled by the
+ * rate from the first one; backwards they are mirrored and keep rising. */
+static guint64 dream_trick_pts(GstDVBVideoSink *self, guint64 pts)
+{
+	if (self->rate == 1.0 || pts == DREAM_PTS_NONE)
+		return pts;
+	if (self->trick_base == DREAM_PTS_NONE)
+		self->trick_base = pts;
+	return (self->trick_base + (gint64)(dream_pts_diff(pts, self->trick_base) / self->rate)) & DREAM_PTS_MASK;
+}
+
+static void dream_flush(GstDVBVideoSink *self)
+{
+	g_queue_clear_full(&self->frames, dream_frame_free);
+	if (self->frame)
+	{
+		g_byte_array_unref(self->frame);
+		self->frame = NULL;
+	}
+	self->flush_vpts = dream_tsync("pts_video");
+	self->start_pts = DREAM_PTS_NONE;
+	/* after a seek the decoder starts at a keyframe */
+	self->wait_keyframe = TRUE;
+	self->trick_base = DREAM_PTS_NONE;
+}
+
+/* collect the PES writes of one access unit, drop the PES header itself */
+static void dream_collect(GstDVBVideoSink *self, GstBuffer *buffer, size_t start, size_t end)
+{
+	GstMapInfo map;
+	if (end <= start || !gst_buffer_map(buffer, &map, GST_MAP_READ))
+		return;
+	if (!self->frame)
+	{
+		self->frame = g_byte_array_new();
+		self->frame_pts = DREAM_PTS_NONE;
+	}
+	if (buffer == self->pesheader_buffer && start == 0 && end >= 9)
+	{
+		guint8 *pes = map.data;
+		if ((pes[7] & 0x80) && self->frame_pts == DREAM_PTS_NONE)
+			self->frame_pts = ((guint64)(pes[9] & 0x0e) << 29 | pes[10] << 22 | (pes[11] & 0xfe) << 14 | pes[12] << 7 | pes[13] >> 1) & DREAM_PTS_MASK;
+		/* codec headers and start codes follow the PES header */
+		start = 9 + pes[8];
+	}
+	if (end > start)
+		g_byte_array_append(self->frame, map.data + start, end - start);
+	gst_buffer_unmap(buffer, &map);
+}
+
+/* Hold the frame until it is at most DREAM_LEAD ahead of the frame on screen.
+ * Returns FALSE when a pause, unlock or flush interrupts the wait. */
+static gboolean dream_wait_lead(GstDVBVideoSink *self, guint64 pts)
+{
+	guint64 last_vpts = 0;
+	int still_ms = 0;
+	struct pollfd pfd;
+	pfd.fd = self->unlockfd[0];
+	pfd.events = POLLIN;
+	while (!self->flushing && !self->paused && !self->unlocking)
+	{
+		guint64 vpts = dream_tsync("pts_video");
+		/* until the first picture shows, the lead counts from the first frame */
+		guint64 ref = vpts == self->flush_vpts ? self->start_pts : vpts;
+		gint32 lead, behind;
+		if (pts == DREAM_PTS_NONE || ref == DREAM_PTS_NONE)
+			return TRUE;
+		/* after a jump the audio may set the clock ahead of the first picture,
+		 * which then waits for the frames up to the clock */
+		behind = (gint32)((guint32)dream_tsync("pts_pcrscr") - (guint32)ref);
+		if (behind > 0 && behind < 10 * 90000)
+			ref += behind;
+		lead = (gint32)((guint32)pts - (guint32)ref);
+		/* far off is a jump, the decoder sorts it out */
+		if (lead <= DREAM_LEAD || lead > 10 * 90000)
+			return TRUE;
+		still_ms = vpts == last_vpts ? still_ms + 10 : 0;
+		if (still_ms > DREAM_STALL_MS)
+			return TRUE;
+		last_vpts = vpts;
+		if (poll(&pfd, 1, 10) > 0)
+			dream_read_commands(self);
+	}
+	return FALSE;
+}
+
+/* 1: written, 0: interrupted, keep the frame, -1: error */
+static int dream_write(GstDVBVideoSink *self, dream_frame_t *entry)
+{
+	struct dream_video_frame frame;
+	struct pollfd pfd[3];
+	guint64 last_vpts = 0, last_pcr = 0;
+	gint64 since = g_get_monotonic_time();
+	int nfds = 2;
+
+	if (!dream_wait_lead(self, entry->pts))
+		return 0;
+
+	pfd[0].fd = self->unlockfd[0];
+	pfd[0].events = POLLIN;
+	pfd[1].fd = self->fd;
+	pfd[1].events = POLLIN;
+	if (self->poll_fd >= 0)
+	{
+		pfd[2].fd = self->poll_fd;
+		pfd[2].events = POLLIN;
+		nfds = 3;
+	}
+	memset(&frame, 0, sizeof(frame));
+	while (entry->offset < entry->data->len)
+	{
+		int ret;
+		if (self->flushing || self->paused || self->unlocking)
+			return 0;
+		/* the driver takes large frames in parts, the rest goes without a PTS */
+		frame.pts = entry->offset ? DREAM_PTS_NONE : entry->pts;
+		frame.bytes[0] = entry->data->len - entry->offset;
+		frame.data[0] = entry->data->data + entry->offset;
+		ret = ioctl(self->fd, DREAM_VIDEO_SET_FRAME, &frame);
+		if (ret > frame.bytes[0])
+		{
+			GST_ERROR_OBJECT(self, "VIDEO_SET_FRAME took %d of %zd bytes", ret, frame.bytes[0]);
+			return -1;
+		}
+		if (ret > 0)
+		{
+			entry->offset += ret;
+			continue;
+		}
+		if (ret < 0 && errno != EAGAIN && errno != EINTR)
+		{
+			/* a decoder the driver failed to start refuses every frame: drop
+			 * it, the audio plays on */
+			if (!self->frames_refused++)
+				GST_WARNING_OBJECT(self, "VIDEO_SET_FRAME of %u bytes failed: %s, dropping the video", entry->data->len, g_strerror(errno));
+			return 1;
+		}
+		/* wait for the decoder, a dropped frame breaks the reference chain */
+		if (poll(pfd, nfds, 50) > 0 && (pfd[0].revents & POLLIN))
+			dream_read_commands(self);
+		dream_read_events(self);
+		{
+			/* the PTS stands still while the clock runs: the decoder hangs */
+			guint64 vpts = dream_tsync("pts_video"), pcr = dream_tsync("pts_pcrscr");
+			gint64 now = g_get_monotonic_time();
+			if (vpts != last_vpts)
+			{
+				last_vpts = vpts;
+				last_pcr = pcr;
+				since = now;
+			}
+			else if (now - since > DREAM_STALL_MS * 1000 && (gint64)(pcr - last_pcr) > DREAM_STALL_MS * 90)
+			{
+				GST_WARNING_OBJECT(self, "decoder stalled, video PTS stood still for %" G_GINT64_FORMAT " ms, clearing the video buffer", (now - since) / 1000);
+				ioctl(self->fd, VIDEO_CLEAR_BUFFER);
+				/* the cleared decoder takes nothing before a keyframe with
+				 * the codec headers */
+				self->must_send_header = TRUE;
+				self->wait_keyframe = TRUE;
+				self->flush_vpts = dream_tsync("pts_video");
+				self->start_pts = DREAM_PTS_NONE;
+				return 1;
+			}
+		}
+	}
+	if (self->start_pts == DREAM_PTS_NONE)
+		self->start_pts = entry->pts;
+	if (++self->frames_written % 25 == 1)
+		dream_post_info(self);
+	return 1;
+}
+
+/* write the collected access unit after the frames held back by a pause */
+static int dream_write_frame(GstDVBVideoSink *self)
+{
+	if (self->frame)
+	{
+		if (self->frame->len)
+		{
+			dream_frame_t *entry = g_new0(dream_frame_t, 1);
+			entry->data = self->frame;
+			entry->pts = dream_trick_pts(self, self->frame_pts);
+			g_queue_push_tail(&self->frames, entry);
+		}
+		else
+			g_byte_array_unref(self->frame);
+		self->frame = NULL;
+	}
+	while (!g_queue_is_empty(&self->frames))
+	{
+		int ret;
+		if (self->flushing)
+		{
+			g_queue_clear_full(&self->frames, dream_frame_free);
+			break;
+		}
+		ret = dream_write(self, g_queue_peek_head(&self->frames));
+		if (ret <= 0)
+			return ret;
+		dream_frame_free(g_queue_pop_head(&self->frames));
+		if (self->wait_keyframe)
+			g_queue_clear_full(&self->frames, dream_frame_free);
+	}
+	return 0;
+}
+
+/* an empty frame makes the decoder show the frames it still holds */
+static void dream_write_eos(GstDVBVideoSink *self)
+{
+	struct dream_video_frame frame;
+	int i;
+	memset(&frame, 0, sizeof(frame));
+	for (i = 0; i < 20 && !self->flushing; i++)
+	{
+		if (ioctl(self->fd, DREAM_VIDEO_SET_FRAME, &frame) >= 0 || (errno != EAGAIN && errno != EINTR))
+			break;
+		gst_sleepms(50);
+	}
+}
+
+static void dream_append_be16(GByteArray *frame, guint value)
+{
+	guint8 b[2] = { value >> 8, value };
+	g_byte_array_append(frame, b, 2);
+}
+
+static void dream_append_be32(GByteArray *frame, guint32 value)
+{
+	guint8 b[4] = { value >> 24, value >> 16, value >> 8, value };
+	g_byte_array_append(frame, b, 4);
+}
+
+/* MJPEG decoder setup: SOI and the default Huffman tables of ITU-T T.81 Annex K */
+static const guint8 dream_jpeg_header[] = {
+	0xff, 0xd8, 0xff, 0xc4, 0x01, 0xa2, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	0x09, 0x0a, 0x0b, 0x01, 0x00, 0x03, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+	0x10, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01,
+	0x7d, 0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61,
+	0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1,
+	0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27,
+	0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+	0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+	0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88,
+	0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6,
+	0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4,
+	0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1,
+	0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+	0xf8, 0xf9, 0xfa, 0x11, 0x00, 0x02, 0x01, 0x02, 0x04, 0x04, 0x03, 0x04, 0x07, 0x05, 0x04, 0x04,
+	0x00, 0x01, 0x02, 0x77, 0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41,
+	0x51, 0x07, 0x61, 0x71, 0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09,
+	0x23, 0x33, 0x52, 0xf0, 0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17,
+	0x18, 0x19, 0x1a, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44,
+	0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64,
+	0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83,
+	0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a,
+	0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8,
+	0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6,
+	0xd7, 0xd8, 0xd9, 0xda, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4,
+	0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
+};
+
+/* VP9: every frame of a superframe as its own AMLV packet, without the index */
+static gboolean dream_frame_vp9(GByteArray *frame, const guint8 *data, gsize size)
+{
+	gsize sizes[8], count = 1, index_size = 0, total = 0, pos, i, b;
+	guint8 marker = data[size - 1];
+	sizes[0] = size;
+	if ((marker & 0xe0) == 0xc0)
+	{
+		guint length_bytes = ((marker >> 3) & 3) + 1;
+		count = (marker & 7) + 1;
+		index_size = 2 + count * length_bytes;
+		if (index_size > size || data[size - index_size] != marker)
+			return FALSE;
+		pos = size - index_size + 1;
+		for (i = 0; i < count; i++)
+		{
+			sizes[i] = 0;
+			for (b = 0; b < length_bytes; b++)
+				sizes[i] |= (gsize)data[pos++] << (8 * b);
+			if (!sizes[i] || sizes[i] > size - index_size - total)
+				return FALSE;
+			total += sizes[i];
+		}
+		if (total != size - index_size)
+			return FALSE;
+	}
+	for (i = 0, pos = 0; i < count; pos += sizes[i], i++)
+	{
+		dream_append_be32(frame, sizes[i] + 4);
+		dream_append_be32(frame, ~(guint32)(sizes[i] + 4));
+		dream_append_be32(frame, 1);
+		g_byte_array_append(frame, (const guint8 *)"AMLV", 4);
+		g_byte_array_append(frame, data + pos, sizes[i]);
+	}
+	return TRUE;
+}
+
+/* WMV9 packet header: 24 bit length split by 0x88 escapes, checksum twice */
+static void dream_wmv_packet(GByteArray *frame, guint8 type, gsize length)
+{
+	guint8 h[22] = { 0, 0, 1, type, 0, length >> 16, 0x88, length >> 8, length, 0x88, 0xff, 0xff, 0x88, 0xff, 0xff, 0x88 };
+	guint i, sum = 0;
+	for (i = 4; i < 16; i++)
+		sum += h[i];
+	h[16] = h[19] = sum >> 8;
+	h[17] = h[20] = sum;
+	h[18] = h[21] = 0x88;
+	g_byte_array_append(frame, h, sizeof(h));
+}
+
+static GstFlowReturn dream_render_raw(GstDVBVideoSink *self, GstBuffer *buffer)
+{
+	GstMapInfo map, headers;
+	GByteArray *frame;
+	gboolean ok = TRUE;
+	if (!gst_buffer_map(buffer, &map, GST_MAP_READ))
+		return GST_FLOW_OK;
+	if (!map.size)
+	{
+		gst_buffer_unmap(buffer, &map);
+		return GST_FLOW_OK;
+	}
+	headers.data = NULL;
+	headers.size = 0;
+	if (self->headers)
+		gst_buffer_map(self->headers, &headers, GST_MAP_READ);
+	frame = g_byte_array_sized_new(map.size + headers.size + 64);
+	switch (self->codec_type)
+	{
+	case CT_VP9:
+		ok = dream_frame_vp9(frame, map.data, map.size);
+		break;
+	case CT_DIVX311:
+		if (self->must_send_header)
+		{
+			guint32 dimensions = self->width << 12 | self->height;
+			guint8 h[6] = { 0x20, dimensions >> 16, dimensions >> 8, dimensions, 0, 0 };
+			dream_append_be32(frame, 1);
+			g_byte_array_append(frame, h, sizeof(h));
+		}
+		g_byte_array_append(frame, (const guint8 *)"\x00\x00\x00\x01\xb6" "DIVX3.11", 13);
+		dream_append_be32(frame, map.size);
+		g_byte_array_append(frame, map.data, map.size);
+		break;
+	case CT_VC1_SM:
+		/* the sequence packet goes with every frame */
+		ok = map.size <= 0xffffff && headers.size + 4 <= 0xffffff;
+		if (ok)
+		{
+			dream_wmv_packet(frame, 0x10, headers.size + 4);
+			dream_append_be16(frame, self->width);
+			dream_append_be16(frame, self->height);
+			g_byte_array_append(frame, headers.data, headers.size);
+			dream_wmv_packet(frame, 0x0d, map.size);
+			g_byte_array_append(frame, map.data, map.size);
+		}
+		break;
+	case CT_MJPEG:
+		ok = map.size >= 2 && map.data[0] == 0xff && map.data[1] == 0xd8;
+		if (ok && self->must_send_header)
+			g_byte_array_append(frame, dream_jpeg_header, sizeof(dream_jpeg_header));
+		g_byte_array_append(frame, map.data, map.size);
+		break;
+	case CT_REAL:
+		if (self->must_send_header && headers.size)
+			g_byte_array_append(frame, headers.data, headers.size);
+		g_byte_array_append(frame, map.data, map.size);
+		break;
+	default: /* CT_VC1 */
+	{
+		gboolean startcode = map.size >= 3 && !memcmp(map.data, "\x00\x00\x01", 3);
+		if (self->must_send_header && headers.size)
+		{
+			/* without the ASF binding byte in front of the sequence header */
+			gsize skip = headers.size > 3 && memcmp(headers.data, "\x00\x00\x01", 3) ? 1 : 0;
+			g_byte_array_append(frame, headers.data + skip, headers.size - skip);
+		}
+		else if (self->must_send_header && !startcode)
+			ok = FALSE;
+		if (ok && !startcode)
+			g_byte_array_append(frame, (const guint8 *)"\x00\x00\x01\x0d", 4);
+		g_byte_array_append(frame, map.data, map.size);
+		break;
+	}
+	}
+	if (self->headers)
+		gst_buffer_unmap(self->headers, &headers);
+	if (!ok)
+	{
+		GST_WARNING_OBJECT(self, "dropping a malformed frame of %" G_GSIZE_FORMAT " bytes", map.size);
+		g_byte_array_unref(frame);
+		gst_buffer_unmap(buffer, &map);
+		return GST_FLOW_OK;
+	}
+	self->must_send_header = FALSE;
+	self->frame = frame;
+	self->frame_pts = DREAM_PTS_NONE;
+	if (GST_BUFFER_PTS_IS_VALID(buffer) || (self->use_dts && GST_BUFFER_DTS_IS_VALID(buffer)))
+	{
+		GstClockTime ts = GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_BUFFER_DTS(buffer);
+		self->frame_pts = gst_util_uint64_scale(ts, 9, 100000) & DREAM_PTS_MASK;
+		self->pts_written = TRUE;
+	}
+	gst_buffer_unmap(buffer, &map);
+	if (dream_write_frame(self) < 0)
+	{
+		GST_ELEMENT_ERROR(self, RESOURCE, WRITE, (NULL), ("video write: %s", g_strerror(errno)));
+		return GST_FLOW_ERROR;
+	}
+	return GST_FLOW_OK;
+}
+#endif
+
 #define VIDEO_CAPS \
   "width = (int) [ 16, 4096 ], " \
   "height = (int) [ 16, 4096 ] "
@@ -239,6 +933,14 @@ GST_STATIC_PAD_TEMPLATE (
 #ifdef HAVE_VB9
 	"video/x-vp9, "
 		VIDEO_CAPS "; "
+#endif
+#ifdef DREAMNEXTGEN
+	/* demuxers often leave out the size */
+	"image/jpeg; "
+	"video/x-pn-realvideo, "
+		VIDEO_CAPS ", rmversion = (int) { 3, 4 }; "
+	"video/x-cavs; "
+	"video/x-avs2; "
 #endif
 	)
 );
@@ -400,6 +1102,12 @@ static void gst_dvbvideosink_init(GstDVBVideoSink *self)
 #else
 	self->use_set_encoding = FALSE;
 #endif
+#ifdef DREAMNEXTGEN
+	self->poll_fd = -1;
+	self->frame = NULL;
+	self->headers = NULL;
+	g_queue_init(&self->frames);
+#endif
 	gst_base_sink_set_sync(GST_BASE_SINK(self), FALSE);
 	gst_base_sink_set_async_enabled(GST_BASE_SINK(self), FALSE);
 }
@@ -512,7 +1220,17 @@ static gint64 gst_dvbvideosink_get_decoder_time(GstDVBVideoSink *self)
 	{
 		cur = self->lastpts;
 	}
+#ifdef DREAMNEXTGEN
+	/* the position in the stream, not the scaled PTS of a trick mode; the
+	 * picture of before the seek has none in it */
+	if (self->rate != 1.0 && (self->trick_base == DREAM_PTS_NONE || dream_tsync("pts_video") == self->flush_vpts))
+		return GST_CLOCK_TIME_NONE;
+	if (self->rate != 1.0)
+		cur = (gint64)((self->trick_base + (gint64)(dream_pts_diff(cur, self->trick_base) * self->rate)) & DREAM_PTS_MASK);
+	cur = gst_util_uint64_scale(cur & DREAM_PTS_MASK, 100000, 9);
+#else
 	cur *= 11111;
+#endif
 	// timestamp_offset is a gstreamer nanoseconds var
 	cur -= self->timestamp_offset;
 
@@ -572,6 +1290,9 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 		{
 			queue_pop(&self->queue);
 		}
+#ifdef DREAMNEXTGEN
+		dream_flush(self);
+#endif
 		self->flushing = FALSE;
 		GST_OBJECT_UNLOCK(self);
 		/* flush while media is playing requires a delay before rendering */
@@ -597,6 +1318,16 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 		pfd[0].events = POLLIN;
 		pfd[1].fd = self->fd;
 		pfd[1].events = POLLIN;
+#ifdef DREAMNEXTGEN
+		/* readable means a pending event here, not an empty buffer: wait
+		 * for the PTS on screen to stand still */
+		pfd[1].fd = -1;
+		if (self->fd >= 0)
+		{
+			dream_read_commands(self);
+			dream_write_eos(self);
+		}
+#endif
 		int x = 0;
 		int retval = 0;
 		gint64 previous_pts = 0;
@@ -700,6 +1431,18 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 		if (format == GST_FORMAT_TIME)
 		{
 			self->timestamp_offset = start - pos;
+#ifdef DREAMNEXTGEN
+			/* a backwards segment starts at its stop, the PTS need no offset */
+			if (rate < 0.0)
+				self->timestamp_offset = 0;
+			/* the decoder's own trick mode starts only for some streams,
+			 * dream_trick_pts scales the PTS instead */
+			if (rate != self->rate)
+			{
+				self->trick_base = DREAM_PTS_NONE;
+				self->rate = rate;
+			}
+#else
 			if (rate != self->rate)
 			{
 				int skip = 0, repeat = 0;
@@ -716,6 +1459,7 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 				ioctl(self->fd, VIDEO_CONTINUE);
 				self->rate = rate;
 			}
+#endif
 		}
 		break;
 	}
@@ -775,6 +1519,11 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 
 static int video_write(GstBaseSink *sink, GstDVBVideoSink *self, GstBuffer *buffer, size_t start, size_t end)
 {
+#ifdef DREAMNEXTGEN
+	/* render writes the collected access unit when it is complete */
+	dream_collect(self, buffer, start, end);
+	return 0;
+#endif
 	size_t written = start;
 	size_t len = end;
 	struct pollfd pfd[2];
@@ -967,6 +1716,16 @@ static GstFlowReturn gst_dvbvideosink_render(GstBaseSink *sink, GstBuffer *buffe
 			gst_sleepms(1200);
 			GST_INFO_OBJECT(self,"RESUME PLAY AFTER FLUSH + 1,2 SECOND");
 	}
+#ifdef DREAMNEXTGEN
+	if (self->wait_keyframe)
+	{
+		if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT))
+			return GST_FLOW_OK;
+		self->wait_keyframe = FALSE;
+	}
+	if (dream_raw_codec(self))
+		return dream_render_raw(self, buffer);
+#endif
 	GstMapInfo map, pesheadermap, codecdatamap;
 	gst_buffer_map(buffer, &map, GST_MAP_READ);
 	original_data = data = map.data;
@@ -1371,6 +2130,10 @@ static GstFlowReturn gst_dvbvideosink_render(GstBaseSink *sink, GstBuffer *buffe
 	}
 
 ok:
+#ifdef DREAMNEXTGEN
+	if (dream_write_frame(self) < 0)
+		goto error;
+#endif
 	gst_buffer_unmap(buffer, &map);
 	gst_buffer_unmap(self->pesheader_buffer, &pesheadermap);
 	if (self->codec_data)
@@ -1507,12 +2270,15 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 						if (!memcmp(tmp+tmp_len, profile_cmp, 2))
 						{
 							uint8_t level_org = tmp[tmp_len + 3];
+							/* not for the Amlogic decoder, it sizes its buffers by the real level */
+#ifndef DREAMNEXTGEN
 							if (level_org > 0x29)
 							{
 								GST_INFO_OBJECT (self, "H264 %s profile@%d.%d patched down to 4.1!", profile_str[i], level_org / 10 , level_org % 10);
 								tmp[tmp_len+3] = 0x29; // level 4.1
 							}
 							else
+#endif
 							{
 								GST_INFO_OBJECT (self, "H264 %s profile@%d.%d", profile_str[i], level_org / 10 , level_org % 10);
 							}
@@ -1766,6 +2532,32 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 		self->codec_type = CT_SPARK;
 		GST_INFO_OBJECT (self, "MIMETYPE video/x-flash-video -> VIDEO_SET_STREAMTYPE, STREAMTYPE_SPARK");
 	}
+#ifdef DREAMNEXTGEN
+	else if (!strcmp (mimetype, "image/jpeg"))
+	{
+		self->stream_type = STREAMTYPE_MJPEG;
+		self->codec_type = CT_MJPEG;
+		GST_INFO_OBJECT (self, "MIMETYPE image/jpeg -> STREAMTYPE_MJPEG");
+	}
+	else if (!strcmp (mimetype, "video/x-pn-realvideo"))
+	{
+		self->stream_type = STREAMTYPE_REAL;
+		self->codec_type = CT_REAL;
+		GST_INFO_OBJECT (self, "MIMETYPE video/x-pn-realvideo -> STREAMTYPE_REAL");
+	}
+	else if (!strcmp (mimetype, "video/x-cavs"))
+	{
+		self->stream_type = STREAMTYPE_AVS;
+		self->codec_type = CT_AVS;
+		GST_INFO_OBJECT (self, "MIMETYPE video/x-cavs -> STREAMTYPE_AVS");
+	}
+	else if (!strcmp (mimetype, "video/x-avs2"))
+	{
+		self->stream_type = STREAMTYPE_AVS2;
+		self->codec_type = CT_AVS2;
+		GST_INFO_OBJECT (self, "MIMETYPE video/x-avs2 -> STREAMTYPE_AVS2");
+	}
+#endif
 
 	/* Adaptive streams can replace the parameter sets without changing codec.
 	 * Send the new AVC/HEVC headers before the next timestamped access unit. */
@@ -1809,7 +2601,12 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 			}
 			self->playing = FALSE;
 		}
-#ifdef VIDEO_SET_ENCODING
+#if defined(DREAMNEXTGEN)
+		if (!self->playing && !dream_setup(self, structure))
+		{
+			GST_ELEMENT_ERROR(self, STREAM, CODEC_NOT_FOUND, (NULL), ("hardware decoder can't handle streamtype %i", self->stream_type));
+		}
+#elif defined(VIDEO_SET_ENCODING)
 		if (self->use_set_encoding)
 		{
 			unsigned int encoding = streamtype_to_encoding(self->stream_type);
@@ -1926,6 +2723,11 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 			if (!self->playing)
 			{
 				ioctl(self->fd, VIDEO_PLAY);
+#ifdef DREAMNEXTGEN
+				/* a codec change while playing */
+				if (!self->paused)
+					ioctl(self->fd, VIDEO_CONTINUE);
+#endif
 			}
 		}
 		self->playing = TRUE;
@@ -1965,6 +2767,28 @@ static gboolean gst_dvbvideosink_start(GstBaseSink *basesink)
 	}
 
 	self->fd = open("/dev/dvb/adapter0/video0", O_RDWR | O_NONBLOCK);
+#ifdef DREAMNEXTGEN
+	self->poll_fd = open("/dev/amvideo_poll", O_RDWR | O_NONBLOCK);
+	f = fopen("/sys/class/video/disable_video", "w");
+	if (f)
+	{
+		fputs("0", f);
+		fclose(f);
+		f = NULL;
+	}
+	if (self->fd >= 0)
+	{
+		/* the state of the previous user */
+		ioctl(self->fd, VIDEO_STOP, 0);
+		ioctl(self->fd, VIDEO_CLEAR_BUFFER);
+	}
+	self->flush_vpts = dream_tsync("pts_video");
+	self->start_pts = DREAM_PTS_NONE;
+	self->wait_keyframe = FALSE;
+	self->trick_base = DREAM_PTS_NONE;
+	self->frames_written = self->frames_refused = 0;
+	self->info_width = self->info_height = self->info_aspect = self->info_framerate = self->info_progressive = -1;
+#endif
 
 	self->pts_written = FALSE;
 	self->lastpts = 0;
@@ -2007,6 +2831,15 @@ static gboolean gst_dvbvideosink_stop(GstBaseSink *basesink)
 	{
 		queue_pop(&self->queue);
 	}
+#ifdef DREAMNEXTGEN
+	dream_flush(self);
+	if (self->poll_fd >= 0)
+		close(self->poll_fd);
+	self->poll_fd = -1;
+	if (self->headers)
+		gst_buffer_unref(self->headers);
+	self->headers = NULL;
+#endif
 
 	f = fopen("/proc/stb/vmpeg/0/fallback_framerate", "w");
 	if (f)
@@ -2090,7 +2923,9 @@ static GstStateChangeReturn gst_dvbvideosink_change_state(GstElement *element, G
 		self->first_paused = TRUE;
 		if (self->fd >= 0)
 		{
-#ifdef DREAMBOX
+			/* the Dream decoder knows the picture only after the first frames,
+			 * dream_post_info reports it then */
+#if defined(DREAMBOX) && !defined(DREAMNEXTGEN)
 			GstStructure *s;
 			GstMessage *msg;
 			int aspect = -1, width = -1, height = -1, framerate = -1, progressive = -1;

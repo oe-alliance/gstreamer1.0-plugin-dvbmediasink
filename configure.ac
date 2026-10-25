@@ -285,13 +285,26 @@ if test "$dags" = "yes"; then
 	AC_DEFINE([DAGS],[1],[build for dags, yes or no ])
 fi
 
+AC_ARG_WITH(audio-device,
+	AS_HELP_STRING([--with-audio-device],[audio decoder device, default /dev/dvb/adapter0/audio0]),
+	[audio_device=$withval],[audio_device=/dev/dvb/adapter0/audio0])
+AC_DEFINE_UNQUOTED([AUDIO_DEVICE],["$audio_device"],[audio decoder device])
+
+AC_ARG_WITH(videosink,
+	AS_HELP_STRING([--with-videosink],[build the video sink, yes or no]),
+	[have_videosink=$withval],[have_videosink=yes])
+AM_CONDITIONAL(HAVE_VIDEOSINK, test "$have_videosink" = "yes")
+
 AC_ARG_WITH(machine,
 	AS_HELP_STRING([--with-machine],[build for machine, $withval]),
 	[machine=$withval],[machine=generic])
 AC_SUBST(machine)
 AC_DEFINE_UNQUOTED(machine,"$machine",[machine])
-if test `echo "$machine" | cut -b 1-2` == "dm"; then
+if test `echo "$machine" | cut -b 1-2` == "dm" -o `echo "$machine" | cut -b 1-5` == "dream"; then
 	AC_DEFINE([DREAMBOX],[1],[build for DREAMBOX ])
+fi
+if test "$machine" == "dreamone" -o "$machine" == "dreamtwo"; then
+	AC_DEFINE([DREAMNEXTGEN],[1],[build for the Dream decoder interface of dreamone and dreamtwo])
 fi
 if test `echo "$machine" | cut -b 1-2` == "vu"; then
 	AC_DEFINE([VUPLUS],[1],[build for VUPLUS ])
